@@ -1,23 +1,17 @@
 import argparse
 import json
-import re
 import os
+import re
 import fnmatch
 from pathlib import Path
 from typing import Generator, Iterable, List, Optional, Tuple
 
-from .cli import (
-    build_title,
-    ensure_output_dir,
-    write_sharded_jsonl,
-)
 
-
-def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Đọc file .txt chứa nhiều khối <doc>...</doc> (1 file hoặc cả thư mục) và xuất JSONL: "
-            "mỗi <doc> là một object (title, summary)."
+            "Trích xuất các khối <doc>...</doc> từ 1 file hoặc thư mục nhiều file, "
+            "xuất JSONL (mỗi doc là một object)."
         )
     )
     src = parser.add_mutually_exclusive_group(required=True)
@@ -28,13 +22,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     src.add_argument(
         "--input-dirs",
         nargs="+",
-        help="Một hoặc nhiều thư mục chứa các file cần quét (hỗ trợ đệ quy).",
+        help="Một hoặc nhiều thư mục chứa các file cần quét.",
     )
 
     parser.add_argument(
         "--glob-pattern",
         default="*.txt",
-        help="Mẫu file cần lấy khi dùng --input-dirs (mặc định: *.txt). Ví dụ: * để lấy tất cả.",
+        help="Mẫu file khi dùng --input-dirs (mặc định: *.txt). Ví dụ: * để lấy tất cả.",
     )
     parser.add_argument(
         "--no-subdirs",
@@ -48,8 +42,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--prefix",
-        default="dataset_doctxt",
-        help="Tiền tố tên file .jsonl (mặc định: dataset_doctxt).",
+        default="doctxt",
+        help="Tiền tố tên file .jsonl (mặc định: doctxt).",
     )
     parser.add_argument(
         "--max-records-per-file",
@@ -61,39 +55,31 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--summary-chars",
         type=int,
         default=1024,
-        help="Số ký tự đầu tiên của nội dung <doc> làm summary (mặc định: 1024).",
-    )
-    parser.add_argument(
-        "--title-source",
-        choices=["filename", "fixed"],
-        default="filename",
-        help=(
-            "Nguồn title fallback khi khối <doc> không có title: filename (tên file) hoặc fixed ('Document')."
-        ),
+        help="Số ký tự đầu của nội dung <doc> làm summary (mặc định: 1024).",
     )
     parser.add_argument(
         "--title-max-chars",
         type=int,
-        default=20,
-        help="Giới hạn ký tự cho title (mặc định: 20).",
+        default=120,
+        help="Giới hạn ký tự cho title trích từ tag (mặc định: 120).",
     )
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Chỉ hiển thị 1-2 bản ghi ví dụ, không ghi file.",
+        help="Chỉ in thử 1-2 bản ghi, không ghi file.",
     )
-    return parser.parse_args(argv)
+    return parser.parse_args()
+
+
+DOC_TITLE_RE = re.compile(r'title="(.*?)"')
 
 
 def extract_title_from_opening_tag(line: str) -> Optional[str]:
-    match = re.search(r'title="(.*?)"', line)
-    if match:
-        return match.group(1)
-    return None
+    match = DOC_TITLE_RE.search(line)
+    return match.group(1) if match else None
 
 
 def iter_doc_blocks(file_path: Path) -> Generator[Tuple[Optional[str], str], None, None]:
-    """Yield (title_in_tag, content_text) for each <doc>...</doc> block."""
     inside = False
     buffer: List[str] = []
     title_in_tag: Optional[str] = None
@@ -117,7 +103,7 @@ def iter_doc_blocks(file_path: Path) -> Generator[Tuple[Optional[str], str], Non
                     buffer.append(line)
 
 
-def read_first_n_chars_from_text(text: str, limit: int) -> str:
+def read_first_n_chars(text: str, limit: int) -> str:
     if limit <= 0:
         return ""
     return text[:limit]
@@ -143,32 +129,60 @@ def collect_files(input_dirs: List[str], pattern: str, recursive: bool) -> List[
     return sorted(set(p.resolve() for p in collected))
 
 
+def write_sharded_jsonl(
+    records: Iterable[dict],
+    output_dir: Path,
+    prefix: str,
+    max_records_per_file: int,
+) -> int:
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    shard_index = 1
+    record_in_shard = 0
+    file_handle = None
+    written_total = 0
+
+    def open_new_shard(idx: int):
+        filename = f"{prefix}_{idx:05d}.jsonl"
+        return (output_dir / filename).open("w", encoding="utf-8", errors="replace")
+
+    try:
+        file_handle = open_new_shard(shard_index)
+        for rec in records:
+            if max_records_per_file > 0 and record_in_shard >= max_records_per_file:
+                file_handle.close()
+                shard_index += 1
+                record_in_shard = 0
+                file_handle = open_new_shard(shard_index)
+
+            json_line = json.dumps(rec, ensure_ascii=False)
+            file_handle.write(json_line + "\n")
+            record_in_shard += 1
+            written_total += 1
+    finally:
+        if file_handle is not None and not file_handle.closed:
+            file_handle.close()
+
+    return written_total
+
+
 def generate_records_for_file(
     file_path: Path,
     summary_chars: int,
-    title_source: str,
     title_max_chars: int,
 ) -> Generator[dict, None, None]:
-    fallback_title_filename = build_title(file_path, "filename", title_max_chars)
-    fallback_title_fixed = "Document"
-
     for title_in_tag, content in iter_doc_blocks(file_path):
-        if title_in_tag and title_in_tag.strip():
-            raw_title = title_in_tag.strip()
-        else:
-            raw_title = fallback_title_filename if title_source == "filename" else fallback_title_fixed
-
+        raw_title = (title_in_tag or "").strip()
+        if not raw_title:
+            # fallback: dùng tên file khi thiếu title trong tag
+            raw_title = file_path.stem
         title = raw_title[:title_max_chars] if title_max_chars > 0 else raw_title
-        summary = read_first_n_chars_from_text(content, summary_chars)
-
-        yield {
-            "title": title,
-            "summary": summary,
-        }
+        summary = read_first_n_chars(content, summary_chars)
+        yield {"title": title, "summary": summary}
 
 
-def run(argv: Optional[List[str]] = None) -> None:
-    args = parse_args(argv)
+def main() -> None:
+    args = parse_args()
 
     if args.input_file:
         files = [Path(args.input_file)]
@@ -180,40 +194,29 @@ def run(argv: Optional[List[str]] = None) -> None:
         raise FileNotFoundError("Không tìm thấy file đầu vào hợp lệ.")
 
     if args.dry_run:
+        # In thử 2 record đầu từ file đầu tiên
         first = files[0]
-        count = 0
-        for rec in generate_records_for_file(
-            first,
-            summary_chars=args.summary_chars,
-            title_source=args.title_source,
-            title_max_chars=args.title_max_chars,
+        for i, rec in enumerate(
+            generate_records_for_file(first, args.summary_chars, args.title_max_chars)
         ):
             print(json.dumps(rec, ensure_ascii=False))
-            count += 1
-            if count >= 2:
+            if i >= 1:
                 break
         return
 
-    output_dir = ensure_output_dir(args.output_dir)
     total = write_sharded_jsonl(
         (
             rec
             for f in files
-            for rec in generate_records_for_file(
-                f,
-                summary_chars=args.summary_chars,
-                title_source=args.title_source,
-                title_max_chars=args.title_max_chars,
-            )
+            for rec in generate_records_for_file(f, args.summary_chars, args.title_max_chars)
         ),
-        output_dir=output_dir,
+        output_dir=Path(args.output_dir),
         prefix=args.prefix,
         max_records_per_file=args.max_records_per_file,
     )
 
-    print(
-        f"Đã ghi {total} doc vào thư mục '{output_dir}'. Tiền tố: '{args.prefix}'."
-    )
+    print(f"Đã ghi {total} doc vào thư mục '{args.output_dir}'. Tiền tố: '{args.prefix}'.")
+
 
 if __name__ == "__main__":
-    run()
+    main()
