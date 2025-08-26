@@ -1,6 +1,8 @@
 import argparse
 import json
 import re
+import os
+import fnmatch
 from pathlib import Path
 from typing import Generator, Iterable, List, Optional, Tuple
 
@@ -14,14 +16,30 @@ from .cli import (
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Đọc một file .txt có nhiều khối <doc>...</doc> và xuất JSONL: "
-            "mỗi <doc> là một object (title, category, summary)."
+            "Đọc file .txt chứa nhiều khối <doc>...</doc> (1 file hoặc cả thư mục) và xuất JSONL: "
+            "mỗi <doc> là một object (title, summary)."
         )
     )
-    parser.add_argument(
+    src = parser.add_mutually_exclusive_group(required=True)
+    src.add_argument(
         "--input-file",
-        required=True,
-        help="Đường dẫn tới file .txt chứa các khối <doc>...</doc>.",
+        help="Đường dẫn tới file chứa các khối <doc>...</doc>.",
+    )
+    src.add_argument(
+        "--input-dirs",
+        nargs="+",
+        help="Một hoặc nhiều thư mục chứa các file cần quét (hỗ trợ đệ quy).",
+    )
+
+    parser.add_argument(
+        "--glob-pattern",
+        default="*.txt",
+        help="Mẫu file cần lấy khi dùng --input-dirs (mặc định: *.txt). Ví dụ: * để lấy tất cả.",
+    )
+    parser.add_argument(
+        "--no-subdirs",
+        action="store_true",
+        help="Không quét thư mục con khi dùng --input-dirs (mặc định có quét).",
     )
     parser.add_argument(
         "--output-dir",
@@ -50,7 +68,7 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         choices=["filename", "fixed"],
         default="filename",
         help=(
-            "Nguồn title fallback khi không có trong tag: filename (tên file) hoặc fixed ('Document')."
+            "Nguồn title fallback khi khối <doc> không có title: filename (tên file) hoặc fixed ('Document')."
         ),
     )
     parser.add_argument(
@@ -105,7 +123,27 @@ def read_first_n_chars_from_text(text: str, limit: int) -> str:
     return text[:limit]
 
 
-def generate_records(
+def collect_files(input_dirs: List[str], pattern: str, recursive: bool) -> List[Path]:
+    collected: List[Path] = []
+    normalized_pattern = pattern or "*"
+    for directory in input_dirs:
+        base = Path(directory)
+        if not base.exists() or not base.is_dir():
+            continue
+        if recursive:
+            for root, _dirs, files in os.walk(base):
+                root_path = Path(root)
+                for name in files:
+                    if fnmatch.fnmatch(name, normalized_pattern):
+                        collected.append(root_path / name)
+        else:
+            for entry in base.iterdir():
+                if entry.is_file() and fnmatch.fnmatch(entry.name, normalized_pattern):
+                    collected.append(entry)
+    return sorted(set(p.resolve() for p in collected))
+
+
+def generate_records_for_file(
     file_path: Path,
     summary_chars: int,
     title_source: str,
@@ -114,12 +152,7 @@ def generate_records(
     fallback_title_filename = build_title(file_path, "filename", title_max_chars)
     fallback_title_fixed = "Document"
 
-    category = file_path.parent.name
-
-    idx = 0
     for title_in_tag, content in iter_doc_blocks(file_path):
-        idx += 1
-
         if title_in_tag and title_in_tag.strip():
             raw_title = title_in_tag.strip()
         else:
@@ -137,31 +170,41 @@ def generate_records(
 def run(argv: Optional[List[str]] = None) -> None:
     args = parse_args(argv)
 
-    input_path = Path(args.input_file)
-    if not input_path.exists() or not input_path.is_file():
-        raise FileNotFoundError(f"Không tìm thấy file: {input_path}")
+    if args.input_file:
+        files = [Path(args.input_file)]
+    else:
+        files = collect_files(args.input_dirs, args.glob_pattern, recursive=not args.no_subdirs)
+
+    files = [p for p in files if p.exists() and p.is_file()]
+    if not files:
+        raise FileNotFoundError("Không tìm thấy file đầu vào hợp lệ.")
 
     if args.dry_run:
-        for i, rec in enumerate(
-            generate_records(
-                input_path,
-                summary_chars=args.summary_chars,
-                title_source=args.title_source,
-                title_max_chars=args.title_max_chars,
-            )
+        first = files[0]
+        count = 0
+        for rec in generate_records_for_file(
+            first,
+            summary_chars=args.summary_chars,
+            title_source=args.title_source,
+            title_max_chars=args.title_max_chars,
         ):
-            if i >= 2:
-                break
             print(json.dumps(rec, ensure_ascii=False))
+            count += 1
+            if count >= 2:
+                break
         return
 
     output_dir = ensure_output_dir(args.output_dir)
     total = write_sharded_jsonl(
-        generate_records(
-            input_path,
-            summary_chars=args.summary_chars,
-            title_source=args.title_source,
-            title_max_chars=args.title_max_chars,
+        (
+            rec
+            for f in files
+            for rec in generate_records_for_file(
+                f,
+                summary_chars=args.summary_chars,
+                title_source=args.title_source,
+                title_max_chars=args.title_max_chars,
+            )
         ),
         output_dir=output_dir,
         prefix=args.prefix,
